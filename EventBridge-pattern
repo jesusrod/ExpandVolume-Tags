@@ -1,0 +1,17 @@
+{
+  "source": [
+    "aws.cloudwatch"
+  ],
+  "resources": [
+    "CLOUDWATCH ARN here"
+  ],
+  "detail-type": [
+    "CloudWatch Alarm State Change"
+  ],
+  "detail": {
+    "state": {
+      "value": [
+        "ALARM"
+      ]
+    }
+  }
