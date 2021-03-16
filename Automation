@@ -1,0 +1,193 @@
+description: '## Read tag and increse volume size'
+schemaVersion: '0.3'
+assumeRole: 'ARN Role with permissions to read from EC2'
+outputs:
+- getInstanceDetails.Instance
+- getRootVolumeId.rootVolumeId
+- getRootVolumeId.volumesize
+- ReadInstanceTag.TagValue
+- CalculateIncrease.newebssize
+- CalculateIncrease.expandyes
+parameters:
+  InstanceId:
+    type: String
+    description: (Required) ID of your EC2 Windows managed instance.
+mainSteps:
+  - name: getInstanceDetails
+    action: aws:executeAwsApi
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{ InstanceId }}'
+    outputs:
+    - Name: VolumeId
+      Selector: "$.Reservations[0].Instances[0].BlockDeviceMappings.EBS.VolumeId"
+      Type: String
+    - Name: Instance
+      Selector: "$.Reservations[0].Instances[0].InstanceId"
+      Type: String
+    - Name: rootDeviceName
+      Selector: "$.Reservations[0].Instances[0].RootDeviceName"
+      Type: String
+  - name: getRootVolumeId
+    action: aws:executeAwsApi
+    maxAttempts: 3
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: DescribeVolumes
+      Filters:
+      -  Name: attachment.device
+         Values: ["{{ getInstanceDetails.rootDeviceName }}"]
+      -  Name: attachment.instance-id
+         Values: ["{{ getInstanceDetails.Instance }}"]
+    outputs:
+      - Name: rootVolumeId
+        Selector: "$.Volumes[0].VolumeId"
+        Type: String
+      - Name: volumesize
+        Selector: "$.Volumes[0].Size"
+        Type: Integer
+  - name: ReadInstanceTag
+    action: 'aws:executeAwsApi'
+    onFailure: step:PublishSNSNotificationfail
+    isCritical: True
+    inputs:
+      Api: DescribeTags
+      Service: EC2
+      Filters:
+      - Name: resource-id
+        Values: ["{{ getInstanceDetails.Instance }}"]
+      - Name: tag:ebsmax
+        Values: ['*']
+    outputs:
+    - Name: TagValue
+      Selector: "$.Tags[0].Value"
+      Type: Integer
+  - name: CalculateIncrease
+    action: 'aws:executeScript'
+    timeoutSeconds: 100
+    description: |
+      ## Evaluate if current EBS size meets tag restriction
+    inputs:
+      Runtime: python3.6
+      Handler: script_handler
+      InputPayload:
+        currentsize: '{{ getRootVolumeId.volumesize }}'
+        maxebssize: '{{ ReadInstanceTag.TagValue }}'
+      Script: |
+        def script_handler(events, context): 
+          import math
+          Currentsize = events['currentsize']
+          Maxebssize = events['maxebssize']
+          newebssize = int((((Currentsize)*20)/100) + Currentsize)
+          expandyes ='No'
+          if newebssize > Maxebssize:
+            print ('unable to increase as EBS volume is at max size permitted')
+            return {'newebssize': newebssize, 'expandyes': expandyes}
+          else:
+            print ('New volume size to increase is 20%')
+            expandyes='Yes'
+            return {'newebssize': newebssize, 'expandyes': expandyes}
+    outputs:
+      - Name: newebssize
+        Selector: $.Payload.newebssize
+        Type: Integer
+      - Name: expandyes
+        Selector: $.Payload.expandyes
+        Type: String
+  - name: evaluateifincrease
+    action: aws:branch
+    onFailure: Abort
+    inputs:
+      Choices:
+        - NextStep: createSnapshot
+          Variable: "{{CalculateIncrease.expandyes}}"
+          StringEquals: 'Yes'
+        - NextStep: PublishSNSNotificationfail
+          Variable: "{{CalculateIncrease.expandyes}}"
+          StringEquals: 'No'
+  - name: createSnapshot
+    action: aws:executeAwsApi
+    inputs:
+      Service: ec2
+      Api: CreateSnapshot
+      VolumeId: "{{ getRootVolumeId.rootVolumeId }}"
+    outputs:
+    - Name: Payload
+      Selector: SnapshotId
+      Type: String
+  - name: ModifyVolumeSize
+    action: 'aws:executeAwsApi'
+    maxAttempts: 3
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: ModifyVolume
+      Size: '{{ CalculateIncrease.newebssize }}'
+      VolumeId: '{{ getRootVolumeId.rootVolumeId }}'
+  - name: ExpandVolume
+    action: 'aws:runCommand'
+    maxAttempts: 3
+    onFailure: Abort
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds: 
+        - '{{ getInstanceDetails.Instance }}'
+      Parameters:
+        commands:
+          - "$Commands = @("
+          - "    '$DiskNumber = (Get-Partition -DriveLetter C).DiskNumber',"
+          - "    'Update-Disk -Number \"$DiskNumber\"',"
+          - "    '$Size = Get-PartitionSupportedSize -DriveLetter C',"
+          - "    'Resize-Partition -DriveLetter C -Size $Size.SizeMax'"
+          - ")"
+          - "$Parameter = @{"
+          - "    commands = $Commands"
+          - "}"
+          - "$Document = 'AWS-RunPowerShellScript'"
+          - ""
+          - "Try {"
+          - "    $Cmd = Send-SSMCommand -DocumentName $Document -Parameter $Parameter -InstanceId {{ getInstanceDetails.Instance }} -Region 'us-east-1'"
+          - "    While ($Cmd.Status -ne 'Success') {"
+          - "        $Cmd = Get-SSMCommand -CommandId $Cmd.CommandId"
+          - "        Start-Sleep 20"
+          - "    }"
+          - "    Write-Host \"C drive is extended\" -ForegroundColor Green"
+          - "}"
+          - "Catch {"
+          - "    Write-Host \"\""
+          - "    Write-Host \"Failed to extend drive\" -ForegroundColor Red"
+          - "}"
+    isCritical: 'false'
+  - name: createTags
+    action: aws:createTags
+    maxAttempts: 3
+    onFailure: Abort
+    inputs:
+      ResourceType: EC2
+      ResourceIds:
+      - '{{ createSnapshot.Payload }}'
+      Tags:
+      - Key: Name
+        Value: 'volume-expanded'
+      - Key: service
+        Value: ssm
+  - name: PublishSNSNotification
+    action: aws:executeAwsApi
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: "SNS ARN topic previously created"
+      Message: "New volume {{getRootVolumeId.rootVolumeId}} size increased"    
+    isEnd: true
+  - name: PublishSNSNotificationfail
+    action: aws:executeAwsApi
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: "SNS ARN topic previously created"
+      Message: "Unable to increase Volume {{getRootVolumeId.rootVolumeId}} due to EBS size max reached"     
+    isEnd: true 
